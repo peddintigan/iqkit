@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "iqkit"
+version = "0.1.0"
+description = "Camera image-quality toolkit: tone-curve recovery, Zone System mapping and Monk Skin Tone tests"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Raj Peddinti" }]
+keywords = ["image quality", "camera", "tone curve", "zone system", "skin tone", "monk skin tone"]
+dependencies = ["numpy>=1.24", "scipy>=1.10", "pillow>=10.1"]
+
+[project.optional-dependencies]
+faces = ["opencv-python-headless<5"]
+dev = ["pytest", "scikit-image", "opencv-python-headless<5"]
+
+[project.scripts]
+iqkit = "iqkit.cli:main"
+
+[tool.setuptools]
+packages = ["iqkit"]

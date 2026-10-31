@@ -1,0 +1,22 @@
+# environments and caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+*.egg-info/
+build/
+dist/
+
+# model files are downloaded by the user, not committed
+models/*.onnx
+
+# keep personal photos and third-party charts out of the repo
+photos/
+private/
+/*.jpg
+/*.jpeg
+/*.png
+/*.tif
+/*.tiff
+/*.heic
