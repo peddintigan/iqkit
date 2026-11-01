@@ -9,7 +9,7 @@ with optional automatic face detection.
 *The demo above comes from a synthetic scene (`examples/make_demo.py`), so the repository contains no photos of people.*
 
 > **Status: early (v0.1), a personal learning and portfolio project.** It is not affiliated with or endorsed by
-> Imatest, RED Digital Cinema, Google or OpenCV, and it is not a replacement for calibrated lab software.
+> Imatest, Google or OpenCV, and it is not a replacement for calibrated lab software.
 > See [Limitations](#limitations) before trusting any number it prints.
 
 ## What it does
