@@ -13,7 +13,7 @@ with optional automatic face detection.
 > Imatest, Google or OpenCV, and it is not a replacement for calibrated lab software.
 =======
 > **Status: early (v0.2), a personal learning and portfolio project.** It is not affiliated with or endorsed by
-> Imatest, RED Digital Cinema, Google or OpenCV, and it is not a replacement for calibrated lab software.
+> Imatest, Google or OpenCV, and it is not a replacement for calibrated lab software.
 >>>>>>> ba4264c (Add face detection, skin colour qualifier, forehead/cheek comparison and colour isolation)
 > See [Limitations](#limitations) before trusting any number it prints.
 
@@ -221,7 +221,6 @@ docs/             images used in this README
 models/           where the YuNet model file goes (not committed)
 ```
 
-This project was written with the help of an AI assistant (Claude); the author reviews, tests and maintains it.
 
 ## Credits and licences
 
