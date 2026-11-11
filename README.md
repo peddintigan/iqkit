@@ -8,8 +8,13 @@ with optional automatic face detection.
 
 *The demo above comes from a synthetic scene (`examples/make_demo.py`), so the repository contains no photos of people.*
 
+<<<<<<< HEAD
 > **Status: early (v0.1), a personal learning and portfolio project.** It is not affiliated with or endorsed by
 > Imatest, Google or OpenCV, and it is not a replacement for calibrated lab software.
+=======
+> **Status: early (v0.2), a personal learning and portfolio project.** It is not affiliated with or endorsed by
+> Imatest, RED Digital Cinema, Google or OpenCV, and it is not a replacement for calibrated lab software.
+>>>>>>> ba4264c (Add face detection, skin colour qualifier, forehead/cheek comparison and colour isolation)
 > See [Limitations](#limitations) before trusting any number it prints.
 
 ## What it does
@@ -19,14 +24,16 @@ with optional automatic face detection.
 | **Tone curves** | Built-in Rec.709, sRGB and gamma curves, or recover a curve from step-chart measurements (handles noise, clipping and a black floor). Convert between exposure in stops, encoded signal and IRE. |
 | **Zone System** | Table of the IRE and code values each zone (0 to X) should read, with a gray-card correction. Zone map and false-colour image of any photo. |
 | **Skin tone (MST)** | The ten MST reference colours with CIELAB values, CIE76 and CIEDE2000 colour differences, where each level should land on a camera curve, region measurement, and a scan that finds skin pixels, restricts them by zone and reports the nearest MST level per region. |
-| **Faces** | Automatic skin patches (cheeks, forehead) on each detected face, using the YuNet neural detector or a built-in Haar fallback. One result per face, with a report of any face that produced no result and why. |
+| **Faces** | Face detection with the YuNet neural detector or a built-in Haar fallback, then one combined skin result per face, with a report of any face that produced no result and why. |
+| **Skin qualifier** | Inside each face, skin is selected by hue, chroma and lightness range, like Resolve's HSL qualifier: seeded from the face's own colour (the eyedropper), eyes, brows, mouth and nostrils left out, specks cleaned, mask exportable. Fixed forehead and cheek patches remain available with `--skin patches`. |
+| **Patch comparison** | Forehead, left cheek and right cheek are also measured independently and compared (L\*, chroma, hue, zone, nearest MST level, ΔE2000), with notes on likely causes of a mismatch (facial hair, fringe or hat, shine, uneven lighting) and an optional comparison picture. |
 
 ## Install
 
 Requires Python 3.10 or newer.
 
 ```bash
-git clone https://github.com/PEDDINTIGAN/iqkit.git
+git clone https://github.com/YOUR-USERNAME/iqkit.git
 cd iqkit
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
@@ -89,13 +96,21 @@ Useful `mst-scan` options:
 | Option | Meaning |
 |---|---|
 | `--faces` | Detect faces and measure skin patches inside them (one result per face). |
-| `--face-parts cheeks\|forehead\|all` | Which patches to use. Cheeks are the most reliable. |
+| `--skin qualifier\|patches` | How skin is chosen inside a face. `qualifier` (default) selects it by colour range; `patches` uses fixed forehead and cheek rectangles. |
+| `--q-hue lo,hi`, `--q-chroma lo,hi`, `--q-luma lo,hi` | Set a qualifier range yourself (hue in degrees, chroma, L\*). Any range you leave out stays seeded from the face. |
+| `--q-hue-tol 18`, `--q-luma-tol 28`, `--q-clean 1` | Width of the seeded hue and lightness ranges, and how much the selection is cleaned (hole filling then speck removal; 0 = off). |
+| `--mask-out FILE` | Save the selected skin as a black-and-white mask. The overlay also outlines it. |
+| `--face-parts cheeks\|forehead\|all` | With `--skin patches`: which patches feed the combined result. Every area is also measured and compared on its own. |
+| `--compare-out FILE` | Write a picture comparing each face's forehead and cheek patches: the actual pixels, the measured colour and the matched MST swatch. |
 | `--face-method auto\|yunet\|haar`, `--face-model PATH` | Detector choice. `auto` uses YuNet if its model file is found, else Haar. |
 | `--zones 4-7` | Keep only pixels in this zone range, to separate lighting from skin tone. |
 | `--wb x,y,w,h` | White-balance from a gray card in the frame. Strongly recommended. |
 | `--mask FILE` | Use your own mask (white = skin) instead of automatic detection. |
 | `--hue min,max`, `--chroma min,max` | Skin colour gate (defaults 35,95 and 3,45; wider with `--faces`). |
-| `--out FILE`, `--overlay original\|paint`, `--no-legend` | Overlay image with the MST orb panel. |
+| `--out FILE`, `--no-legend` | Save the overlay picture, with or without the MST orb panel. |
+| `--overlay original\|paint\|isolate` | `original`: your photo with face outlines, selection outline and MST chips. `paint`: skin repainted in MST swatch colours. `isolate`: colour only on the selected skin, everything else black and white, no marks on the faces. |
+| `--side-by-side` | With `isolate`: put the untouched photo next to the isolated one, to compare the skin colour. |
+| `--isolate-region skin\|face`, `--feather 2` | With `isolate`: keep colour on the qualified skin (eyes and lips go gray) or on each whole face; soften the edge by this many pixels (0 = hard). The isolated picture is saved at full resolution. |
 
 The step-chart CSV for curve recovery has the header `stops,value`: each patch's exposure in stops relative to
 the 18% gray patch, and its measured mean encoded value.
@@ -143,6 +158,14 @@ synthetic data. Verify it on your own images before relying on it.
 * Colour: sRGB to CIELAB with a D65 white point; ΔE76 and CIEDE2000 (checked against the published Sharma test pairs).
 * The nearest MST level is found by CIE76 distance to the ten reference colours, as in Cheng (2024).
 * Per-face results use the median Lab colour of the patch pixels that survive the exposure, zone and colour filters.
+* **Qualifier.** Per face, the seed colour is the trimmed median Lab of a core region (the darkest 15% and lightest 10% are
+  dropped, so hair and shine cannot move it). The qualifier keeps pixels within a hue range (default ±18°), a chroma range
+  (±(7 + 50% of the seed's chroma)) and a wide L\* range (default ±28, so lit and shaded skin both count). Eyes with brows,
+  mouth and nostrils are cut out first, using the detector's landmarks (or typical positions for Haar boxes). Defaults
+  were set by looking at a few images and are starting points, not calibrated values.
+* Forehead and cheeks are also measured separately. They "agree" when their nearest MST levels are at most one level
+  apart and the forehead-vs-cheeks CIEDE2000 is at most 5. These thresholds are heuristics, and the notes about
+  causes (facial hair, fringe, shine, lighting) are possibilities to check on the picture, not diagnoses.
 
 ## Limitations
 
@@ -151,9 +174,14 @@ synthetic data. Verify it on your own images before relying on it.
   lighter than MST 2). Use it to organise tests, not to label people.
 * **The result depends on lighting, white balance and the camera's rendering**, not only on the person. Use a gray card
   and `--wb`. Under a warm colour cast, neutral objects can pass the skin colour gate.
+* **The qualifier is a colour heuristic.** Hair, beards, glasses frames and shadows of similar hue can still pass, and light
+  or gray facial hair is hard to separate from skin by colour. Very dark skin has low chroma, so its hue is less reliable.
+  Save the mask (`--mask-out`) and look at it before trusting a number.
 * **Shading mixes with skin tone.** One face spans several zones, so its pixels match several MST levels. Prefer the
   per-face median, and use `--zones` to select the well-lit part.
-* **Assumes sRGB primaries and full-range values** for images. No ICC profile handling.
+* **Colour handling.** Pictures are read as sRGB: an embedded colour profile (for example Display P3 from a phone) is
+  converted to sRGB first, and the camera's EXIF rotation is applied. Pictures the tool saves carry an sRGB profile so
+  viewers do not have to guess. Full-range values are assumed, and 16-bit images are not colour-converted.
 * **Tone curves are single-channel** (one curve, not separate R, G and B).
 * **MST placement is a model**: it treats each swatch as a diffuse reflector with the luminance implied by its L\*.
 * **Detection is not validated here.** Measure the detection rate by lighting condition and skin tone on your own
@@ -185,12 +213,15 @@ The tests use synthetic images with known answers, plus a public-domain sample p
 face-detection tests (they skip themselves if OpenCV or scikit-image are missing).
 
 ```
-iqkit/            package: tone.py (curves, zones), skintone.py (MST, colour maths), scan.py, faces.py, cli.py
+iqkit/            package: tone.py (curves, zones), skintone.py (MST, colour maths), scan.py, faces.py,
+                  compare.py (forehead vs cheeks), qualify.py (colour qualifier), cli.py
 tests/            unit tests
 examples/         make_demo.py (synthetic scene)
 docs/             images used in this README
 models/           where the YuNet model file goes (not committed)
 ```
+
+This project was written with the help of an AI assistant (Claude); the author reviews, tests and maintains it.
 
 ## Credits and licences
 

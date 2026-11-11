@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from . import qualify as qualifymod
 from . import skintone, tone
 
 N_LEVELS = len(skintone.MST_LEVELS)
@@ -74,6 +75,8 @@ def scan(
     wb_roi=None,
     mask=None,
     labels=None,
+    part_labels=None,
+    qualifier=None,
     max_pixels=1_000_000,
     min_area_frac=0.002,
     n_regions=5,
@@ -86,6 +89,12 @@ def scan(
     labels     : integer array the size of `img`, 0 = ignore, i > 0 = skin candidates of face/subject i
                  (see faces.face_labels). Unlike `mask`, the colour gate is still applied inside them,
                  and each label becomes one reported region.
+    part_labels: label image from faces.face_part_labels (4*face + part code). Each patch is then also
+                 measured on its own and reported in out["part_report"], so forehead and cheeks can be
+                 compared; it does not change which pixels feed the per-face result.
+    qualifier  : needs `labels`. Dict with "core" (label image of seed regions, from faces.face_region_labels)
+                 and optional "hue_tol", "chroma_tol", "luma_tol", "manual", "clean" (see qualify.qualify). The
+                 per-face colour qualifier then replaces the global hue/chroma gate.
     Returns a dict; see the keys at the end of the function.
     """
     img = np.clip(np.asarray(img, float), 0.0, 1.0)[..., :3]
@@ -109,6 +118,10 @@ def scan(
     chroma_ok = (c >= chroma[0]) & (c <= chroma[1])
     colour = hue_ok & chroma_ok
     small_labels = None
+    colour_names = ("hue", "chroma")
+    qualifier_seeds = None
+    if qualifier is not None and labels is None:
+        raise ValueError("qualifier needs labels (faces.face_region_labels)")
     if mask is not None and labels is not None:
         raise ValueError("give either mask or labels, not both")
     if mask is not None:
@@ -121,6 +134,19 @@ def scan(
         if labels.shape[:2] != (h, w):
             raise ValueError("labels size does not match the image")
         small_labels = labels[k // 2 :: k, k // 2 :: k][:sh, :sw]
+        if qualifier is not None:
+            small_core = np.asarray(qualifier["core"])[k // 2 :: k, k // 2 :: k][:sh, :sw]
+            qmask, qseeds = qualifymod.qualify(
+                lab, hu, c, small_labels, small_core,
+                hue_tol=qualifier.get("hue_tol", 18.0),
+                chroma_tol=qualifier.get("chroma_tol", (7.0, 0.5)),
+                luma_tol=qualifier.get("luma_tol", 28.0),
+                manual=qualifier.get("manual"),
+                clean=qualifier.get("clean", 1),
+            )
+            colour, hue_ok, chroma_ok = qmask, qmask, np.ones_like(qmask)
+            colour_names = ("qualifier", "chroma")
+            qualifier_seeds = qseeds
         sel = valid & colour & (small_labels > 0)
     else:
         sel = valid & colour
@@ -143,11 +169,19 @@ def scan(
         np.add.at(out["zone_level_counts"], (zr.zone_int[sel], lv - 1), 1)
         out["regions"] = _regions(sel, lab, zr, levels_img, k, min_area_frac, n_regions, small_labels)
 
+    if part_labels is not None:
+        pl = np.asarray(part_labels)
+        if pl.shape[:2] != (h, w):
+            raise ValueError("part_labels size does not match the image")
+        small_parts = pl[k // 2 :: k, k // 2 :: k][:sh, :sw]
+        out["part_report"] = _part_report(small_parts, valid & colour, lab, zr)
     if small_labels is not None:
         zone_ok = np.ones_like(valid)
         if zones is not None:
             zone_ok = (zr.zone_float >= zones[0] - 0.5) & (zr.zone_float < zones[1] + 0.5)
-        out["face_report"] = _face_report(small_labels, zr, zone_ok, hue_ok, chroma_ok, hu, c)
+        out["face_report"] = _face_report(small_labels, zr, zone_ok, hue_ok, chroma_ok, hu, c, colour_names)
+    if qualifier_seeds is not None:
+        out["qualifier_seeds"] = qualifier_seeds
     out["overlay"] = _overlay(small, sel, levels_img)
     out["original_small"] = (np.clip(original_small, 0, 1) * 255 + 0.5).astype(np.uint8)
     out["zone_int"] = zr.zone_int
@@ -155,7 +189,32 @@ def scan(
     return out
 
 
-def _face_report(labels, zr, zone_ok, hue_ok, chroma_ok, hue, chroma):
+def _part_report(small_parts, usable, lab, zr):
+    """Measure every labelled patch on its own: median colour of its usable pixels and nearest MST level."""
+    rows = []
+    for v in np.unique(small_parts[small_parts > 0]):
+        pix = small_parts == v
+        use = pix & usable
+        ys, xs = np.nonzero(pix)
+        row = {"face": int(v) // 4, "code": int(v) % 4, "pixels": int(pix.sum()), "used": int(use.sum()), "median_lab": None,
+               "bbox": (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)}
+        if row["used"]:
+            med = np.median(lab[use], axis=0)
+            level, de, _ = skintone.nearest_mst(med)
+            chroma, hue = skintone.chroma_hue(med)
+            row.update(
+                median_lab=med,
+                nearest_mst=level,
+                nearest_dE=de,
+                chroma=float(chroma),
+                hue=float(hue),
+                median_zone=float(np.median(zr.zone_float[use])),
+            )
+        rows.append(row)
+    return rows
+
+
+def _face_report(labels, zr, zone_ok, hue_ok, chroma_ok, hue, chroma, colour_names=("hue", "chroma")):
     """For each face label: how many patch pixels there were, how many were used, and what removed the rest.
 
     Pixels are attributed to the first filter that rejects them, in this order:
@@ -180,8 +239,8 @@ def _face_report(labels, zr, zone_ok, hue_ok, chroma_ok, hue, chroma):
                 "excluded": {
                     "exposure": int(bad.sum()),
                     "zone": int(no_zone.sum()),
-                    "hue": int(no_hue.sum()),
-                    "chroma": int(no_chroma.sum()),
+                    colour_names[0]: int(no_hue.sum()),
+                    colour_names[1]: int(no_chroma.sum()),
                 },
                 "median_hue": float(np.median(hue[pix])),
                 "median_chroma": float(np.median(chroma[pix])),
@@ -242,6 +301,37 @@ def _overlay(small, sel, levels_img):
     if sel.any():
         out[sel] = skintone.MST_RGB[levels_img[sel].astype(int) - 1].astype(np.uint8)
     return out
+
+
+def isolate_colour(img, mask, feather=0.0):
+    """Keep colour only where `mask` is set; everything else becomes black and white.
+
+    img     : encoded RGB picture, float 0..1 (or uint8)
+    mask    : boolean or 0..1 array, at the picture's size or smaller (it is scaled up smoothly)
+    feather : Gaussian softening of the mask edge, in the mask's own pixels (0 = hard edge)
+    The grays are the Rec.709 luma of the encoded values, so brightness is unchanged.
+    Returns uint8 RGB at the picture's size.
+    """
+    from PIL import Image
+
+    a = np.asarray(img)
+    a = a.astype(float) / 255.0 if a.dtype.kind in "ui" else a.astype(float)
+    a = np.clip(a, 0.0, 1.0)[..., :3]
+    h, w = a.shape[:2]
+    m = np.asarray(mask, float)
+    if feather > 0:
+        try:
+            from scipy import ndimage
+
+            m = ndimage.gaussian_filter(m, feather)
+        except ImportError:  # pragma: no cover
+            pass
+    if m.shape != (h, w):
+        m = np.asarray(Image.fromarray(m.astype(np.float32)).resize((w, h), Image.BILINEAR), float)
+    m = np.clip(m, 0.0, 1.0)[..., None]
+    gray = tone.luma(a)[..., None]
+    out = m * a + (1.0 - m) * gray
+    return (out * 255 + 0.5).astype(np.uint8)
 
 
 def add_legend(overlay, level_share=None):

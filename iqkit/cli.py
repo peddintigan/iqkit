@@ -7,6 +7,9 @@
   python -m iqkit.cli mst-roi photo.png --roi 120,80,60,60 [--expect 6] [--curve srgb]
   python -m iqkit.cli mst-scan photo.png --curve srgb [--zones 4-7] [--wb x,y,w,h] [--mask m.png] --out overlay.png
   python -m iqkit.cli mst-scan photo.png --curve srgb --faces [--face-method auto|haar|yunet --face-model m.onnx] --out overlay.png
+  python -m iqkit.cli mst-scan photo.png --curve srgb --faces --compare-out comparison.png   (forehead vs cheeks, per face)
+  python -m iqkit.cli mst-scan photo.png --curve srgb --faces --skin qualifier --mask-out skin_mask.png
+  python -m iqkit.cli mst-scan photo.png --curve srgb --faces --overlay isolate --out isolated.png   (colour only on skin)
 
 steps.csv has a header `stops,value`: patch exposure in stops relative to the 18% gray patch,
 and the measured mean encoded value for that patch.
@@ -18,7 +21,9 @@ import csv
 
 import numpy as np
 
+from . import compare as comparemod
 from . import faces as facemod
+from . import qualify as qualifymod
 from . import scan as scanmod
 from . import skintone, tone
 
@@ -79,6 +84,37 @@ def _print_mst_roi(args, curve, gray):
         )
 
 
+def _print_qualifier(res, args):
+    """The seed colour and ranges the qualifier used for each face."""
+    print("\ncolour qualifier (skin selected by range inside each face)")
+    for i, sd in sorted(res["qualifier_seeds"].items()):
+        L, a, b = sd["lab"]
+        print(f"  face {i}: seed L* {L:.0f}, chroma {sd['chroma']:.0f}, hue {sd['hue']:.0f} deg "
+              f"(from {sd['n_seed']} core pixels)")
+    manual = [n for n, v in (("hue", args.q_hue), ("chroma", args.q_chroma), ("L*", args.q_luma)) if v]
+    seeded = [n for n in ("hue", "chroma", "L*") if n not in manual]
+    if seeded:
+        print(f"  seeded ranges: hue +/-{args.q_hue_tol:g} deg, chroma +/-(7 + 50% of seed), L* +/-{args.q_luma_tol:g}"
+              + ("" if len(seeded) == 3 else f" (for {', '.join(seeded)})"))
+    if manual:
+        print(f"  manual ranges set for: {', '.join(manual)}")
+
+
+def _faces_output(res, found, args):
+    """Per-face report, forehead/cheek comparison, and the optional comparison picture."""
+    _print_face_report(res, found)
+    summaries = comparemod.summarise_faces(res.get("part_report", []))
+    if summaries:
+        print("\nforehead and cheeks measured independently (heuristic agreement check)")
+        print(comparemod.format_comparison(summaries))
+    if args.compare_out:
+        from PIL import Image
+
+        pic = comparemod.comparison_image(res["original_small"], found, summaries, res["scale"])
+        _save_picture(pic, args.compare_out)
+        print(f"wrote {args.compare_out}")
+
+
 def _print_face_report(res, found):
     """One line per detected face: result or the reason it has none."""
     by_label = {r["label"]: r for r in res["regions"]}
@@ -101,6 +137,8 @@ def _print_face_report(res, found):
                 "chroma": f"its patches have median chroma {rep['median_chroma']:.1f}; try --chroma {max(0, rep['median_chroma'] - 8):.0f},{rep['median_chroma'] + 15:.0f}",
                 "zone": f"its patches sit near zone {rep['median_zone']:.1f}; widen or drop --zones",
                 "exposure": "its patches are clipped or crushed; check exposure",
+                "qualifier": "the skin range around its seed colour matched few pixels; widen --q-hue-tol or --q-luma-tol, "
+                             "or set --q-hue, --q-chroma and --q-luma yourself",
             }[cause]
             print(f"      no result: {hint}")
     for i in range(len(found) - len(res["face_report"])):
@@ -131,7 +169,7 @@ def _run_mst_scan(args, curve, gray):
         from PIL import Image
 
         mask = np.asarray(Image.open(args.mask).convert("L")) > 127
-    found, labels = [], None
+    found, labels, part_labels, qualifier = [], None, None, None
     parts = {"all": facemod.PARTS, "cheeks": ("left_cheek", "right_cheek"), "forehead": ("forehead",)}[args.face_parts]
     if args.faces:
         if mask is not None:
@@ -148,7 +186,14 @@ def _run_mst_scan(args, curve, gray):
         if not found:
             print("no faces detected; try --min-face 0.02, a clearer photo, the YuNet detector, or use --mask")
             return
-        labels = facemod.face_labels(img.shape, found, parts)
+        if args.skin == "qualifier":
+            labels, core, part_labels = facemod.face_region_labels(img.shape, found)
+            manual = {k: _pair(v) for k, v in (("hue", args.q_hue), ("chroma", args.q_chroma), ("luma", args.q_luma)) if v}
+            qualifier = {"core": core, "hue_tol": args.q_hue_tol, "luma_tol": args.q_luma_tol, "manual": manual,
+                         "clean": args.q_clean}
+        else:
+            labels = facemod.face_labels(img.shape, found, parts)
+            part_labels = facemod.face_part_labels(img.shape, found)  # all three patches, measured independently
     res = scanmod.scan(
         img,
         curve,
@@ -159,16 +204,20 @@ def _run_mst_scan(args, curve, gray):
         wb_roi=wb,
         mask=mask,
         labels=labels,
+        part_labels=part_labels,
+        qualifier=qualifier,
         max_pixels=args.max_pixels,
         n_regions=args.regions,
     )
     sh, sw = res["work_shape"]
     print(f"analysed at {sw}x{sh} (downsample x{res['scale']}); skin pixels: {res['selected']} "
           f"({100 * res['selected_fraction']:.1f}% of image)")
+    if res.get("qualifier_seeds"):
+        _print_qualifier(res, args)
     if not res["selected"]:
         print("no pixels matched; relax --hue/--chroma/--zones or supply --mask")
         if args.faces:
-            _print_face_report(res, found)
+            _faces_output(res, found, args)
         return
 
     print("\nnearest MST level, all selected pixels")
@@ -193,26 +242,73 @@ def _run_mst_scan(args, curve, gray):
             f"Lab {L:.0f},{a:.0f},{b:.0f}  -> MST {r['nearest_mst']} (dE76 {r['nearest_dE']:.1f});  pixels: {tops}"
         )
     if args.faces:
-        _print_face_report(res, found)
+        _faces_output(res, found, args)
     print("\nCheck the overlay: colour gating is a heuristic and can select non-skin or miss shaded skin.")
     if args.out:
         from PIL import Image
 
         style = args.overlay if args.overlay != "auto" else ("original" if args.faces else "paint")
-        pic = res["original_small"] if style == "original" else res["overlay"]
-        if found:
-            levels = {r["label"]: r["nearest_mst"] for r in res["regions"]}
-            pic = facemod.draw_faces(pic, found, res["scale"], parts, levels)
+        if style == "isolate":
+            use_face = found and (args.isolate_region == "face" or qualifier is None)
+            if use_face:
+                if args.isolate_region == "skin":
+                    print("note: --skin patches selects only small patches, so colour is kept on each whole face instead")
+                pic = scanmod.isolate_colour(img, facemod.face_ellipse_mask(img.shape, found), args.feather * res["scale"])
+            else:
+                pic = scanmod.isolate_colour(img, res["selected_mask"], args.feather)
+            if args.side_by_side:
+                pic = np.hstack([(np.clip(img, 0, 1) * 255 + 0.5).astype(np.uint8)[..., :3], pic])
+        else:
+            pic = res["original_small"] if style == "original" else res["overlay"]
+            if qualifier is not None:
+                pic = pic.copy()
+                pic[qualifymod.mask_outline(res["selected_mask"])] = (0, 220, 255)  # outline of the selected skin
+            if found:
+                levels = {r["label"]: r["nearest_mst"] for r in res["regions"]}
+                pic = facemod.draw_faces(pic, found, res["scale"], parts, levels, show_patches=qualifier is None)
         if not args.no_legend:
             pic = scanmod.add_legend(pic, res["level_share"])
-        Image.fromarray(pic).save(args.out)
+        _save_picture(pic, args.out)
         print(f"wrote {args.out}")
+    if args.mask_out:
+        from PIL import Image
+
+        Image.fromarray((res["selected_mask"] * 255).astype(np.uint8)).save(args.mask_out)
+        print(f"wrote {args.mask_out} (selected skin at {res['work_shape'][1]}x{res['work_shape'][0]})")
+
+
+def _save_picture(arr, path):
+    """Save an 8-bit RGB picture with an embedded sRGB profile, so viewers do not have to guess its colours
+    (an untagged picture may be shown in the display's own, often wider, colour space and look over-saturated)."""
+    from PIL import Image, ImageCms
+
+    profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    Image.fromarray(arr).save(path, icc_profile=profile)
 
 
 def _load_image(path):
-    from PIL import Image
+    """Load a picture as float 0..1 sRGB, honouring the camera's rotation and any embedded colour profile.
 
-    im = Image.open(path)
+    Phone photos are often tagged Display P3 and stored rotated with an EXIF flag. Ignoring either gives
+    wrong colours (over-saturated, reddish skin) or a sideways picture the face detector cannot read.
+    """
+    import io
+
+    from PIL import Image, ImageCms, ImageOps
+
+    im = ImageOps.exif_transpose(Image.open(path))
+    icc = im.info.get("icc_profile")
+    if icc and im.mode in ("RGB", "RGBA"):
+        try:
+            src = ImageCms.ImageCmsProfile(io.BytesIO(icc))
+            desc = ImageCms.getProfileDescription(src).strip()
+            if "srgb" not in desc.lower():
+                intent = getattr(getattr(ImageCms, "Intent", None), "RELATIVE_COLORIMETRIC", 1)
+                im = ImageCms.profileToProfile(im.convert("RGB"), src, ImageCms.createProfile("sRGB"),
+                                               renderingIntent=intent, outputMode="RGB")
+                print(f"note: converted the picture's colour profile ({desc}) to sRGB")
+        except (ImageCms.PyCMSError, OSError, ValueError, TypeError):
+            print("note: could not read the picture's colour profile; assuming sRGB")
     arr = np.asarray(im)
     scale = 65535.0 if arr.dtype == np.uint16 else 255.0
     if arr.ndim == 3 and arr.shape[2] > 3:
@@ -241,12 +337,30 @@ def main(argv=None):
             sp.add_argument("--face-method", choices=("auto", "haar", "yunet"), default="auto",
                             help="auto = YuNet if its model file is found, otherwise Haar (weaker)")
             sp.add_argument("--face-model", help="path to the YuNet .onnx file (or set IQKIT_YUNET_MODEL, or put it in ./models/)")
-            sp.add_argument("--overlay", choices=("auto", "original", "paint"), default="auto",
-                            help="original = your photo in its own colours; paint = skin repainted in MST swatch colours "
+            sp.add_argument("--overlay", choices=("auto", "original", "paint", "isolate"), default="auto",
+                            help="original = your photo with outlines and labels; paint = skin repainted in MST swatch "
+                                 "colours; isolate = colour only on the selected skin, the rest black and white, no marks "
                                  "(auto: original with --faces, paint otherwise)")
+            sp.add_argument("--isolate-region", choices=("skin", "face"), default="skin",
+                            help="with --overlay isolate: keep colour on the qualified skin, or on each whole face")
+            sp.add_argument("--feather", type=float, default=2.0, help="with --overlay isolate: edge softening in pixels (0 = hard)")
+            sp.add_argument("--side-by-side", action="store_true",
+                            help="with --overlay isolate: put the untouched photo next to the isolated one to compare colours")
             sp.add_argument("--min-face", type=float, default=0.04, help="smallest face as a fraction of the shorter image side")
             sp.add_argument("--face-parts", choices=("all", "cheeks", "forehead"), default="all",
-                            help="which patches to measure inside each face (the forehead patch often catches hair and brows)")
+                            help="which patches feed the combined per-face result (every patch is also measured on its own "
+                                 "and compared; hair, brows and facial hair can affect individual patches)")
+            sp.add_argument("--compare-out", help="write a picture comparing each face's forehead and cheek areas")
+            sp.add_argument("--skin", choices=("qualifier", "patches"), default="qualifier",
+                            help="with --faces: qualifier = select skin by hue/chroma/lightness range inside each face "
+                                 "(like Resolve's HSL qualifier); patches = fixed forehead and cheek rectangles")
+            sp.add_argument("--q-hue", help="qualifier hue range in degrees, lo,hi (default: seeded per face)")
+            sp.add_argument("--q-chroma", help="qualifier chroma range, lo,hi (default: seeded per face)")
+            sp.add_argument("--q-luma", help="qualifier L* range, lo,hi (default: seeded per face)")
+            sp.add_argument("--q-hue-tol", type=float, default=18.0, help="seeded hue range: +/- degrees (default 18)")
+            sp.add_argument("--q-luma-tol", type=float, default=28.0, help="seeded L* range: +/- (default 28)")
+            sp.add_argument("--q-clean", type=int, default=1, help="specks removed from the selection, 0 = off (default 1)")
+            sp.add_argument("--mask-out", help="write the selected skin as a black-and-white mask picture")
         if name == "zonemap":
             sp.add_argument("--out", help="write false-colour PNG here")
         if name == "mst-roi":
@@ -284,7 +398,7 @@ def main(argv=None):
     if args.out:
         from PIL import Image
 
-        Image.fromarray(tone.false_color(res)).save(args.out)
+        _save_picture(tone.false_color(res), args.out)
         print(f"wrote {args.out}")
 
 

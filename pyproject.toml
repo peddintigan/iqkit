@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "iqkit"
-version = "0.1.0"
+version = "0.2.0"
 description = "Camera image-quality toolkit: tone-curve recovery, Zone System mapping and Monk Skin Tone tests"
 readme = "README.md"
 requires-python = ">=3.10"

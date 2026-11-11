@@ -66,6 +66,7 @@ class Face:
     angle: float = 0.0  # rotation of the image copy the face was found in (Haar only)
     source: str = ""
     extra: dict = field(default_factory=dict)
+    frame: tuple | None = None  # (origin, u, v, D): eye-line midpoint, unit vectors along/down the face, eye distance
 
 
 # --------------------------------------------------------------------------- #
@@ -118,15 +119,54 @@ def patches_from_landmarks(lm):
     return outline, patches
 
 
+def frame_from_landmarks(lm):
+    """Face frame from five landmarks: origin at the midpoint of the eyes, u along the eye line,
+    v down the face, D = distance between the eyes. All face geometry below is in units of D."""
+    lm = np.asarray(lm, float).reshape(5, 2)
+    e1, e2 = sorted([lm[0], lm[1]], key=lambda p: p[0])
+    D = float(np.linalg.norm(e2 - e1))
+    if D < 1e-6:
+        raise ValueError("degenerate landmarks: both eyes at the same point")
+    u = (e2 - e1) / D
+    return (e1 + e2) / 2, u, np.array([-u[1], u[0]]), D
+
+
+def frame_from_box(box, transform=None):
+    """Approximate face frame for a detector box: eyes about 38% down the box, D = width / 2.2."""
+    x, y, w, h = box
+    o = np.array([x + w / 2, y + 0.38 * h], float)
+    u, v = np.array([1.0, 0.0]), np.array([0.0, 1.0])
+    if transform is not None:
+        T = np.asarray(transform, float)
+        o = T[:, :2] @ o + T[:, 2]
+        u, v = T[:, :2] @ u, T[:, :2] @ v
+    return o, u, v, w / 2.2
+
+
+def face_frame(face):
+    """The face's frame, derived from its outline polygon if it was not stored."""
+    if face.frame is not None:
+        return face.frame
+    p = np.asarray(face.outline, float)
+    wv, hv = p[1] - p[0], p[3] - p[0]
+    w, h = np.linalg.norm(wv), np.linalg.norm(hv)
+    return p[0] + 0.5 * wv + 0.38 * hv, wv / w, hv / h, w / 2.2
+
+
 def make_face(outline, patches, **kw):
     return Face(box=_bbox(outline), outline=outline, patches=patches, **kw)
 
 
-def face_labels(shape, faces, parts=PARTS):
-    """Integer label image: 0 = background, i = skin patches of face i (largest face = 1).
+PART_CODES = {"forehead": 1, "left_cheek": 2, "right_cheek": 3}
+CODE_PARTS = {v: k for k, v in PART_CODES.items()}
 
-    Where patches of different faces overlap, each contested pixel goes to the face whose
-    patch centre is nearest (relative to patch size), so neighbouring faces cannot erase each other.
+
+def face_part_labels(shape, faces, parts=PARTS):
+    """Integer label image: 0 = background, 4*i + code = patch `code` of face i (largest face = 1).
+
+    Codes: 1 forehead, 2 left cheek, 3 right cheek (see PART_CODES). Where patches overlap, each
+    contested pixel goes to the patch whose centre is nearest (relative to patch size), so
+    neighbouring faces cannot erase each other.
     """
     from PIL import Image, ImageDraw
 
@@ -150,9 +190,106 @@ def face_labels(shape, faces, parts=PARTS):
             r2 = max(1.0, 0.25 * len(ys))  # (half the patch side)^2
             d = ((xs - c[0]) ** 2 + (ys - c[1]) ** 2) / r2
             win = d < best[ys, xs]
-            labels[ys[win], xs[win]] = i
+            labels[ys[win], xs[win]] = 4 * i + PART_CODES[name]
             best[ys[win], xs[win]] = d[win]
     return labels
+
+
+def face_labels(shape, faces, parts=PARTS):
+    """Integer label image: 0 = background, i = skin patches of face i (largest face = 1)."""
+    pl = face_part_labels(shape, faces, parts)
+    return np.where(pl > 0, pl // 4, 0).astype(np.int32)
+
+
+# --------------------------------------------------------------------------- #
+# Skin regions for the colour qualifier (lengths in units of D, the eye distance)
+# --------------------------------------------------------------------------- #
+SKIN_ELLIPSE = (0.0, 0.40, 0.95, 1.35)  # cx, cy, a, b: forehead to chin, cheek to cheek, slightly shrunk
+CORE_ELLIPSE = (0.0, 0.45, 0.55, 0.75)  # where the qualifier takes its seed colour
+FOREHEAD_Y = -0.30  # frame y above this is "forehead"
+CHEEK_Y, CHEEK_X = 0.35, 0.25  # frame y below CHEEK_Y and |x| above CHEEK_X are the cheeks
+
+
+def exclusion_ellipses(face):
+    """Eyes with brows, mouth and nose tip as (cx, cy, a, b) in face-frame units. Uses the detected
+    landmarks when there are any, otherwise typical positions."""
+    o, u, v, D = face_frame(face)
+    if face.landmarks is not None:
+        lm = np.asarray(face.landmarks, float).reshape(5, 2)
+        rel = lambda p: np.array([((p - o) @ u) / D, ((p - o) @ v) / D])
+        e1, e2, nose = rel(lm[0]), rel(lm[1]), rel(lm[2])
+        m1, m2 = rel(lm[3]), rel(lm[4])
+        mouth = (m1 + m2) / 2
+        mw = float(abs(m1[0] - m2[0]))
+        eyes = [e1, e2]
+    else:
+        eyes = [np.array([-0.5, 0.0]), np.array([0.5, 0.0])]
+        nose, mouth, mw = np.array([0.0, 0.95]), np.array([0.0, 1.45]), 0.8
+    out = [(e[0], e[1] - 0.12, 0.42, 0.34) for e in eyes]  # eye and brow
+    out.append((mouth[0], mouth[1], max(0.55, 0.7 * mw + 0.1), 0.34))  # lips and teeth
+    out.append((nose[0], nose[1], 0.28, 0.16))  # nostrils
+    return out
+
+
+def face_region_labels(shape, faces):
+    """Label images for the colour qualifier.
+
+    Returns (region, core, parts), all int32 of the picture's shape:
+      region  face number i inside that face's skin ellipse, minus eyes, brows, mouth and nostrils
+      core    face number i inside the smaller ellipse used to pick the seed colour
+      parts   4*i + code (forehead 1, left cheek 2, right cheek 3) for the qualifier's measurement areas
+    Overlaps between faces go to the face whose ellipse centre is nearer (relative to its size).
+    """
+    h, w = shape[:2]
+    region = np.zeros((h, w), np.int32)
+    core = np.zeros((h, w), np.int32)
+    parts = np.zeros((h, w), np.int32)
+    best = np.full((h, w), np.inf, np.float32)
+    cx, cy, a, b = SKIN_ELLIPSE
+    for i, f in enumerate(faces, 1):
+        o, u, v, D = face_frame(f)
+        reach = D * max(abs(cx) + a, abs(cy) + b) * 1.05
+        x0, x1 = int(max(o[0] - reach, 0)), int(min(o[0] + reach + 1, w))
+        y0, y1 = int(max(o[1] - reach, 0)), int(min(o[1] + reach + 1, h))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        ys, xs = np.mgrid[y0:y1, x0:x1]
+        dx, dy = xs - o[0], ys - o[1]
+        X, Y = (dx * u[0] + dy * u[1]) / D, (dx * v[0] + dy * v[1]) / D
+        dist = ((X - cx) / a) ** 2 + ((Y - cy) / b) ** 2
+        keep = dist <= 1.0
+        for ex, ey, ea, eb in exclusion_ellipses(f):
+            keep &= ((X - ex) / ea) ** 2 + ((Y - ey) / eb) ** 2 > 1.0
+        win = keep & (dist < best[y0:y1, x0:x1])
+        best[y0:y1, x0:x1][win] = dist[win]
+        region[y0:y1, x0:x1][win] = i
+        ccx, ccy, ca, cb = CORE_ELLIPSE
+        in_core = win & (((X - ccx) / ca) ** 2 + ((Y - ccy) / cb) ** 2 <= 1.0)
+        core[y0:y1, x0:x1][in_core] = i
+        sub = parts[y0:y1, x0:x1]
+        sub[win & (Y < FOREHEAD_Y)] = 4 * i + PART_CODES["forehead"]
+        sub[win & (Y > CHEEK_Y) & (X < -CHEEK_X)] = 4 * i + PART_CODES["left_cheek"]
+        sub[win & (Y > CHEEK_Y) & (X > CHEEK_X)] = 4 * i + PART_CODES["right_cheek"]
+    return region, core, parts
+
+
+def face_ellipse_mask(shape, faces):
+    """Boolean picture-size mask of each face's whole skin ellipse, eyes, mouth and nostrils included."""
+    h, w = shape[:2]
+    mask = np.zeros((h, w), bool)
+    cx, cy, a, b = SKIN_ELLIPSE
+    for f in faces:
+        o, u, v, D = face_frame(f)
+        reach = D * max(abs(cx) + a, abs(cy) + b) * 1.05
+        x0, x1 = int(max(o[0] - reach, 0)), int(min(o[0] + reach + 1, w))
+        y0, y1 = int(max(o[1] - reach, 0)), int(min(o[1] + reach + 1, h))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        ys, xs = np.mgrid[y0:y1, x0:x1]
+        dx, dy = xs - o[0], ys - o[1]
+        X, Y = (dx * u[0] + dy * u[1]) / D, (dx * v[0] + dy * v[1]) / D
+        mask[y0:y1, x0:x1] |= ((X - cx) / a) ** 2 + ((Y - cy) / b) ** 2 <= 1.0
+    return mask
 
 
 # --------------------------------------------------------------------------- #
@@ -256,7 +393,7 @@ def faces_from_yunet_rows(rows, scale=1.0, min_px=0):
             outline, patches = patches_from_landmarks(lm)
         except ValueError:
             continue
-        out.append(make_face(outline, patches, score=float(r[14]), landmarks=lm, source="yunet"))
+        out.append(make_face(outline, patches, score=float(r[14]), landmarks=lm, source="yunet", frame=frame_from_landmarks(lm)))
     return out
 
 
@@ -300,7 +437,8 @@ def _detect_haar(u8, min_size_frac, rotations, cascades, scale_factor, min_neigh
         for c in classifiers:
             for box in c.detectMultiScale(g, scaleFactor=scale_factor, minNeighbors=min_neighbors, minSize=(min_px, min_px)):
                 outline, patches = patches_from_box(tuple(int(v) for v in box), None if angle == 0 else Minv)
-                found.append(make_face(outline, patches, angle=float(angle), source="haar"))
+                found.append(make_face(outline, patches, angle=float(angle), source="haar",
+                                       frame=frame_from_box(tuple(int(v) for v in box), None if angle == 0 else Minv)))
     # a real face is usually hit by several cascades/rotations; a single stray hit is often a false positive
     return [f for f in merge_faces(found) if f.extra.get("votes", 1) >= min_votes]
 
@@ -334,13 +472,16 @@ def detect_faces(img, method="auto", model_path=None, min_size_frac=0.04, max_si
             f.outline = f.outline / s
             f.patches = {n: p / s for n, p in f.patches.items()}
             f.box = _bbox(f.outline)
+            if f.frame is not None:
+                o, u, v, D = f.frame
+                f.frame = (o / s, u, v, D / s)
     return faces
 
 
 # --------------------------------------------------------------------------- #
 # Drawing
 # --------------------------------------------------------------------------- #
-def draw_faces(img, faces, scale=1, parts=PARTS, levels=None):
+def draw_faces(img, faces, scale=1, parts=PARTS, levels=None, show_patches=True):
     """Draw face outlines (white, numbered) and skin patches (cyan) on a copy of `img` (uint8 RGB).
 
     `scale` is the downsample factor of `img` relative to the original image.
@@ -357,7 +498,7 @@ def draw_faces(img, faces, scale=1, parts=PARTS, levels=None):
         outline = [tuple(p / scale) for p in f.outline]
         dr.line(outline + [outline[0]], fill=(255, 255, 255), width=2)
         dr.text((outline[0][0] + 3, outline[0][1] + 2), str(i), fill=(255, 255, 255))
-        for name in parts:
+        for name in parts if show_patches else ():
             poly = [tuple(p / scale) for p in f.patches[name]]
             dr.line(poly + [poly[0]], fill=(0, 220, 255), width=2)
         if levels and i in levels:
